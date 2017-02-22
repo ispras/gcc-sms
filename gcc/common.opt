@@ -1663,11 +1663,11 @@ Common RejectNegative Joined UInteger
 -fmessage-length=<number>	Limit diagnostics to <number> characters per line.  0 suppresses line-wrapping
 
 fmodulo-sched
-Common Report Var(flag_modulo_sched) Optimization
+Common Report Var(flag_modulo_sched) Init(1) Optimization
 Perform SMS based modulo scheduling before the first scheduling pass
 
 fmodulo-sched-allow-regmoves
-Common Report Var(flag_modulo_sched_allow_regmoves) Optimization
+Common Report Var(flag_modulo_sched_allow_regmoves) Init(1) Optimization
 Perform SMS based modulo scheduling with register moves allowed
 
 fmove-loop-invariants
