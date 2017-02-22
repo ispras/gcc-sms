@@ -312,24 +312,52 @@ create_ddg_dep_no_link (ddg_ptr g, ddg_node_ptr from, ddg_node_ptr to,
 static void
 add_cross_iteration_register_deps (ddg_ptr g, df_ref last_def)
 {
-  int regno = DF_REF_REGNO (last_def);
+  unsigned int regno = DF_REF_REGNO (last_def);
   struct df_link *r_use;
   int has_use_in_bb_p = false;
-  rtx_insn *def_insn = DF_REF_INSN (last_def);
+  rtx_insn *insn, *def_insn = DF_REF_INSN (last_def);
   ddg_node_ptr last_def_node = get_node_of_insn (g, def_insn);
   ddg_node_ptr use_node;
 #ifdef ENABLE_CHECKING
   struct df_rd_bb_info *bb_info = DF_RD_BB_INFO (g->bb);
 #endif
   df_ref first_def = df_bb_regno_first_def_find (g->bb, regno);
+  vec<df_ref> clobbers;
+  df_ref first_write_def = NULL;
+  df_ref def;
+  unsigned int uid;
+
+  clobbers.create (0);
+
+  FOR_BB_INSNS (g->bb, insn)
+    {
+      if (!INSN_P (insn))
+        continue;
+      uid = INSN_UID (insn);
+      for (def = DF_INSN_UID_DEFS (uid); def; def = DF_REF_NEXT_LOC (def))
+        {
+          if (DF_REF_REGNO (def) == regno)
+            {
+             clobbers.safe_push (def);
+             if (!(DF_REF_FLAGS (def)
+                   & (DF_REF_MUST_CLOBBER | DF_REF_MAY_CLOBBER)))
+               {
+                 first_write_def = def;
+                 break;
+               }
+           }
+        }
+      if (first_write_def != NULL)
+       break;
+    }
 
   gcc_assert (last_def_node);
-  gcc_assert (first_def);
+  gcc_assert (first_write_def);
 
 #ifdef ENABLE_CHECKING
-  if (DF_REF_ID (last_def) != DF_REF_ID (first_def))
+  if (DF_REF_ID (last_def) != DF_REF_ID (first_write_def))
     gcc_assert (!bitmap_bit_p (&bb_info->gen,
-			       DF_REF_ID (first_def)));
+			       DF_REF_ID (first_write_def)));
 #endif
 
   /* Create inter-loop true dependences and anti dependences.  */
@@ -355,30 +383,35 @@ add_cross_iteration_register_deps (ddg_ptr g, df_ref last_def)
 	}
       else if (!DEBUG_INSN_P (use_insn))
 	{
+	  unsigned int i;
+	  df_ref curr_def;
 	  /* Add anti deps from last_def's uses in the current iteration
-	     to the first def in the next iteration.  We do not add ANTI
-	     dep when there is an intra-loop TRUE dep in the opposite
-	     direction, but use regmoves to fix such disregarded ANTI
-	     deps when broken.	If the first_def reaches the USE then
-	     there is such a dep.  */
-	  ddg_node_ptr first_def_node = get_node_of_insn (g,
-							  DF_REF_INSN (first_def));
-
-	  gcc_assert (first_def_node);
-
-         /* Always create the edge if the use node is a branch in
-            order to prevent the creation of reg-moves.  
-            If the address that is being auto-inc or auto-dec in LAST_DEF
-            is used in USE_INSN then do not remove the edge to make sure
-            reg-moves will not be created for that address.  */
-          if (DF_REF_ID (last_def) != DF_REF_ID (first_def)
-              || !flag_modulo_sched_allow_regmoves
-	      || JUMP_P (use_node->insn)
-              || autoinc_var_is_used_p (DF_REF_INSN (last_def), use_insn)
-	      || def_has_ccmode_p (DF_REF_INSN (last_def)))
-            create_ddg_dep_no_link (g, use_node, first_def_node, ANTI_DEP,
-                                    REG_DEP, 1);
-
+	     to the first def and all clobbers before it in the next iteration.
+	     We do not add ANTI dep when there is an intra-loop TRUE dep
+	     in the opposite direction, but use regmoves to fix such
+	     disregarded ANTI deps when broken.	If the curr_def reaches
+	     the USE then there is such a dep.  */
+	  FOR_EACH_VEC_ELT (clobbers, i, curr_def)
+	    {
+	      if (DF_REF_ID (last_def) != DF_REF_ID (curr_def)
+		  /* Some hard regs (for ex. CC-flags) can't be renamed.
+                  || HARD_REGISTER_P (DF_REF_REG (last_def)) */
+		  || !flag_modulo_sched_allow_regmoves
+		  /* If the address that is being auto-inc or auto-dec in LAST_DEF
+		     is used in USE_INSN then do not remove the edge to make sure
+		     reg-moves will not be created for that address.  */
+		  || autoinc_var_is_used_p (DF_REF_INSN (last_def), use_insn)
+		  /* Always create the edge if the use node is a branch in
+		     order to prevent the creation of reg-moves.  */
+		  || JUMP_P (use_node->insn))
+		{
+	          ddg_node_ptr curr_def_node = get_node_of_insn (g,
+						DF_REF_INSN (curr_def));
+		  gcc_assert (curr_def_node);
+		  create_ddg_dep_no_link (g, use_node, curr_def_node,
+					  ANTI_DEP, REG_DEP, 1);
+	        }
+	    }
 	}
     }
   /* Create an inter-loop output dependence between LAST_DEF (which is the
@@ -392,14 +425,16 @@ add_cross_iteration_register_deps (ddg_ptr g, df_ref last_def)
     {
       ddg_node_ptr dest_node;
 
-      if (DF_REF_ID (last_def) == DF_REF_ID (first_def))
+      if (DF_REF_ID (last_def) == DF_REF_ID (first_write_def))
 	return;
 
-      dest_node = get_node_of_insn (g, DF_REF_INSN (first_def));
+      dest_node = get_node_of_insn (g, DF_REF_INSN (first_write_def));
       gcc_assert (dest_node);
       create_ddg_dep_no_link (g, last_def_node, dest_node,
 			      OUTPUT_DEP, REG_DEP, 1);
     }
+
+  clobbers.release ();
 }
 /* Build inter-loop dependencies, by looking at DF analysis backwards.  */
 static void
