@@ -75,6 +75,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "tree-pass.h"
 #include "dbgcnt.h"
 #include "loop-unroll.h"
+#include "recog.h"
 
 #ifdef INSN_SCHEDULING
 
@@ -245,7 +246,8 @@ static void set_node_sched_params (ddg_ptr);
 static partial_schedule_ptr sms_schedule_by_order (ddg_ptr, int, int, int *);
 static void permute_partial_schedule (partial_schedule_ptr, rtx_insn *);
 static void generate_prolog_epilog (partial_schedule_ptr, struct loop *,
-                                    rtx, rtx);
+				    rtx, bool, bool, rtx, int64_t,
+				    bool, int64_t, rtx *);
 static int calculate_stage_count (partial_schedule_ptr, int);
 static void calculate_must_precede_follow (ddg_node_ptr, int, int,
 					   int, int, sbitmap, sbitmap, sbitmap);
@@ -278,7 +280,7 @@ typedef struct node_sched_params
 
 typedef struct node_sched_params node_sched_params;
 
-/* The following three functions are copied from the current scheduler
+/* The following two functions are copied from the current scheduler
    code in order to use sched_analyze() for computing the dependencies.
    They are used when initializing the sched_info structure.  */
 static const char *
@@ -422,37 +424,165 @@ doloop_register_get (rtx_insn *head ATTRIBUTE_UNUSED, rtx_insn *tail ATTRIBUTE_U
 #endif
 }
 
-/* Check if COUNT_REG is set to a constant in the PRE_HEADER block, so
-   that the number of iterations is a compile-time constant.  If so,
-   return the rtx_insn that sets COUNT_REG to a constant, and set COUNT to
-   this constant.  Otherwise return 0.  */
+/* Same as previous for loop with always-the-same-step counter.  */
+static rtx
+nondoloop_register_get (rtx_insn *head, rtx_insn *tail, int cmp_side,
+                        rtx_insn **addsub_output, rtx_insn **cmp_output)
+{
+  rtx_insn *insn, *addsub, *cmp;
+  rtx temp, reg, flagreg, end;
+
+  /* Check jump instruction form */
+  temp = single_set (tail);
+  if (temp == NULL_RTX
+      || SET_DEST (temp) != pc_rtx
+      || GET_CODE (SET_SRC (temp)) != IF_THEN_ELSE
+      || GET_CODE (XEXP (SET_SRC (temp), 1)) != LABEL_REF
+      || XEXP (SET_SRC (temp), 2) != pc_rtx)
+    return NULL_RTX;
+
+  /* Check loop exit condition */
+  temp = XEXP (SET_SRC (temp), 0);
+  if (GET_CODE (temp) != NE || XEXP (temp, 1) != const0_rtx)
+    return NULL_RTX;
+
+  /* Flags register */
+  flagreg = XEXP (temp, 0);
+
+  /* Searching comparison instruction */
+  cmp = PREV_INSN (tail);
+  while (cmp != PREV_INSN (head))
+    {
+      if (INSN_P (cmp) && reg_set_p (flagreg, cmp))
+        break;
+      cmp = PREV_INSN (cmp);
+    }
+  if (cmp == PREV_INSN (head))
+    return NULL_RTX;
+
+  /* Check comparison */
+  temp = single_set (cmp);
+  if (temp == NULL_RTX
+      || ! rtx_equal_p (flagreg, SET_DEST (temp))
+      || GET_CODE (SET_SRC (temp)) != COMPARE)
+    return NULL_RTX;
+
+  /* Loop register */
+  gcc_assert (0 <= cmp_side && cmp_side <= 1);
+  reg = XEXP (SET_SRC (temp), cmp_side);
+  if (! REG_P (reg))
+    return NULL_RTX;
+
+  /* End value */
+  end = XEXP (SET_SRC (temp), 1 - cmp_side);
+  if (! REG_P (end) && ! CONST_INT_P (end))
+    return NULL_RTX;
+
+  /* Searching register add\sub instruction */
+  addsub = PREV_INSN (cmp);
+  while (addsub != PREV_INSN (head))
+    {
+      if (INSN_P (addsub) && reg_set_p (reg, addsub))
+        break;
+      addsub = PREV_INSN (addsub);
+    }
+  if (addsub == PREV_INSN (head))
+    return NULL_RTX;
+
+  /* Checking register change instruction */
+  temp = single_set (addsub);
+  if (temp == NULL_RTX || ! rtx_equal_p (reg, SET_DEST (temp)))
+    return NULL_RTX;
+  temp = SET_SRC (temp);
+  if ((GET_CODE (temp) != PLUS && GET_CODE (temp) != MINUS)
+      || ! rtx_equal_p (reg, XEXP (temp, 0))
+      || ! (CONST_INT_P (XEXP (temp, 1))))
+    return NULL_RTX;
+
+  /* No other REG and END (if reg) modifications allowed */
+  for (insn = head; insn != tail; insn = NEXT_INSN (insn))
+    {
+      if (REG_P(end) && reg_set_p (end, insn))
+        {
+          if (dump_file)
+          {
+            fprintf (dump_file, "SMS end register found ");
+            print_rtl_single (dump_file, reg);
+            fprintf (dump_file, " outside write in insn:\n");
+            print_rtl_single (dump_file, insn);
+          }
+         return NULL_RTX;
+       }
+      if (insn != addsub && reg_set_p (reg, insn))
+        {
+          if (dump_file)
+          {
+            fprintf (dump_file, "SMS count_reg found ");
+            print_rtl_single (dump_file, reg);
+            fprintf (dump_file, " outside write in insn:\n");
+            print_rtl_single (dump_file, insn);
+          }
+          return NULL_RTX;
+        }
+    }
+
+  *addsub_output = addsub;
+  *cmp_output = cmp;
+  return reg;
+}
+
+/* Check if REG is set to a constant in the PRE_HEADER block.
+   If possible to find, return the rtx that sets REG.
+   If REG is set to a constant (probably not directly),
+   set IS_CONST to true and VALUE to that constant value.  */
 static rtx_insn *
-const_iteration_count (rtx count_reg, basic_block pre_header,
-		       int64_t * count)
+search_const_init (basic_block pre_header, rtx reg, bool *is_const,
+                   int64_t *value)
 {
   rtx_insn *insn;
   rtx_insn *head, *tail;
 
-  if (! pre_header)
-    return NULL;
+  if (!pre_header)
+    {
+      *is_const = false;
+      return NULL;
+    }
 
   get_ebb_head_tail (pre_header, pre_header, &head, &tail);
 
   for (insn = tail; insn != PREV_INSN (head); insn = PREV_INSN (insn))
     if (NONDEBUG_INSN_P (insn) && single_set (insn) &&
-	rtx_equal_p (count_reg, SET_DEST (single_set (insn))))
+	rtx_equal_p (reg, SET_DEST (single_set (insn))))
       {
-	rtx pat = single_set (insn);
+	rtx src, pat = single_set (insn);
+	src = SET_SRC(pat);
 
-	if (CONST_INT_P (SET_SRC (pat)))
+	if (CONST_INT_P (src))
 	  {
-	    *count = INTVAL (SET_SRC (pat));
-	    return insn;
+	    *is_const = true;
+	    *value = INTVAL (src);
 	  }
+	else if (REG_P (src))
+	  { /* Check if previous insn sets SRC = constant.  */
+	    pat = single_set (PREV_INSN (insn));
+	    if (pat != NULL_RTX && rtx_equal_p (src, SET_DEST (pat))
+		&& CONST_INT_P (SET_SRC (pat)))
+	      {
+		*is_const = true;
+		*value = INTVAL (SET_SRC (pat));
+	      }
+	    else
+	      *is_const = false;
+	  }
+	else
+	  *is_const = false;
 
-	return NULL;
+	return insn;
       }
+    else if (reg_set_p (reg, insn))
+      break;
 
+  *is_const = false;
   return NULL;
 }
 
@@ -860,6 +990,7 @@ apply_reg_moves (partial_schedule_ptr ps)
 
       EXECUTE_IF_SET_IN_BITMAP (move->uses, 0, i_use, sbi)
 	{
+	  /* FIXME: use validate_change.  */
 	  replace_rtx (ps->g->nodes[i_use].insn, move->old_reg, move->new_reg);
 	  df_insn_rescan (ps->g->nodes[i_use].insn);
 	}
@@ -1134,7 +1265,7 @@ clear:
 
 static void
 duplicate_insns_of_cycles (partial_schedule_ptr ps, int from_stage,
-			   int to_stage, rtx count_reg)
+			   int to_stage, rtx count_reg, bool doloop_p)
 {
   int row;
   ps_insn_ptr ps_ij;
@@ -1146,14 +1277,14 @@ duplicate_insns_of_cycles (partial_schedule_ptr ps, int from_stage,
 	int first_u, last_u;
 	rtx_insn *u_insn;
 
-        /* Do not duplicate any insn which refers to count_reg as it
-           belongs to the control part.
+        /* In doloop case do not duplicate any insn which refers
+	   to count_reg as it belongs to the control part.
            The closing branch is scheduled as well and thus should
            be ignored.
            TODO: This should be done by analyzing the control part of
            the loop.  */
 	u_insn = ps_rtl_insn (ps, u);
-        if (reg_mentioned_p (count_reg, u_insn)
+        if ((doloop_p && reg_mentioned_p (count_reg, u_insn))
             || JUMP_P (u_insn))
           continue;
 
@@ -1173,7 +1304,10 @@ duplicate_insns_of_cycles (partial_schedule_ptr ps, int from_stage,
 /* Generate the instructions (including reg_moves) for prolog & epilog.  */
 static void
 generate_prolog_epilog (partial_schedule_ptr ps, struct loop *loop,
-                        rtx count_reg, rtx count_init)
+			rtx count_reg, bool doloop_p, bool count_init_isconst,
+			rtx fin_reg, int64_t fin_nonconst_adjust,
+			bool create_reg, int64_t reg_val,
+			rtx *created_reg)
 {
   int i;
   int last_stage = PS_STAGE_COUNT (ps) - 1;
@@ -1182,12 +1316,12 @@ generate_prolog_epilog (partial_schedule_ptr ps, struct loop *loop,
   /* Generate the prolog, inserting its insns on the loop-entry edge.  */
   start_sequence ();
 
-  if (!count_init)
+  if (doloop_p && !count_init_isconst)
     {
-      /* Generate instructions at the beginning of the prolog to
-         adjust the loop count by STAGE_COUNT.  If loop count is constant
-         (count_init), this constant is adjusted by STAGE_COUNT in
-         generate_prolog_epilog function.  */
+      /* In doloop we generate instructions at the beginning of the prolog to
+         adjust the initial value of doloop counter by STAGE_COUNT.
+	 If loop count is constant, this adjustment is done outside this
+         function, simply correcting the source of initialization insn.  */
       rtx sub_reg = NULL_RTX;
 
       sub_reg = expand_simple_binop (GET_MODE (count_reg), MINUS, count_reg,
@@ -1199,8 +1333,40 @@ generate_prolog_epilog (partial_schedule_ptr ps, struct loop *loop,
         emit_move_insn (count_reg, sub_reg);
     }
 
+  if (!doloop_p)
+    {
+      /* In non-doloop we generate instructions at the beginning of
+         the prolog to adjust the final value (with this value loop count
+	 register is compared to check whether the loop should stop).  */
+      if (fin_nonconst_adjust != 0)
+	{
+	  /* If the final value is in a register - create another register
+	     to store a shifted value.  */
+	  rtx new_reg, reg = NULL_RTX;
+	  reg = gen_reg_rtx (GET_MODE (fin_reg));
+	  new_reg = expand_simple_binop (GET_MODE (fin_reg), MINUS, fin_reg,
+					 GEN_INT (fin_nonconst_adjust),
+					 reg, 0, OPTAB_DIRECT);
+	  gcc_assert (REG_P (new_reg));
+	  if (REGNO (new_reg) != REGNO (reg))
+	    emit_move_insn (reg, new_reg);
+	  *created_reg = new_reg;
+	}
+      else if (create_reg)
+	{
+	  /* If old final value is an immediate, and the new one can't be
+	     an immediate, we create a register to store it.  If both values
+	     are immediate the adjustment is done outside this fuction,
+	     just correcting the constant value in compare intruction.  */
+	  rtx reg = NULL_RTX;
+	  reg = gen_reg_rtx (GET_MODE (count_reg));
+	  emit_move_insn (reg, GEN_INT (reg_val));
+	  *created_reg = reg;
+	}
+    }
+
   for (i = 0; i < last_stage; i++)
-    duplicate_insns_of_cycles (ps, 0, i, count_reg);
+    duplicate_insns_of_cycles (ps, 0, i, count_reg, doloop_p);
 
   /* Put the prolog on the entry edge.  */
   e = loop_preheader_edge (loop);
@@ -1214,7 +1380,7 @@ generate_prolog_epilog (partial_schedule_ptr ps, struct loop *loop,
   start_sequence ();
 
   for (i = 0; i < last_stage; i++)
-    duplicate_insns_of_cycles (ps, i + 1, last_stage, count_reg);
+    duplicate_insns_of_cycles (ps, i + 1, last_stage, count_reg, doloop_p);
 
   /* Put the epilogue on the exit edge.  */
   gcc_assert (single_exit (loop));
@@ -1504,13 +1670,30 @@ sms_schedule (void)
           continue;
         }
 
-      /* Make sure this is a doloop.  */
-      if ( !(count_reg = doloop_register_get (head, tail)))
-      {
-        if (dump_file)
-          fprintf (dump_file, "SMS doloop_register_get failed\n");
-	continue;
-      }
+      /* Is this a doloop?  */
+      if ((count_reg = doloop_register_get (head, tail)))
+        {
+	  if (dump_file)
+	    fprintf (dump_file, "SMS doloop\n");
+        }
+      else if ((count_reg = nondoloop_register_get (head, tail, 0,
+						    &insn, &insn)))
+	{
+	  if (dump_file)
+	    fprintf (dump_file, "SMS non-doloop\n");
+	}
+      else if ((count_reg = nondoloop_register_get (head, tail, 1,
+						    &insn, &insn)))
+	{
+	  if (dump_file)
+	    fprintf (dump_file, "SMS non-doloop with transposed cmp\n");
+	}
+      else
+	{
+	  if (dump_file)
+	    fprintf (dump_file, "SMS imcompatible loop\n");
+	  continue;
+	}
 
       /* Don't handle BBs with calls or barriers
 	 or !single_set with the exception of instructions that include
@@ -1560,7 +1743,6 @@ sms_schedule (void)
 	    fprintf (dump_file, "SMS create_ddg failed\n");
 	  continue;
         }
-
       g_arr[loop->num] = g;
       if (dump_file)
         fprintf (dump_file, "...OK\n");
@@ -1572,15 +1754,28 @@ sms_schedule (void)
     fprintf (dump_file, "=========================\n\n");
   }
 
+  df_clear_flags (DF_LR_RUN_DCE);
+
   /* We don't want to perform SMS on new loops - created by versioning.  */
   FOR_EACH_LOOP (loop, 0)
     {
+      bool doloop_p, count_fin_isconst, count_init_isconst;
+      bool was_immediate = false;
+      bool prolog_create_reg = false;
+      int prolog_fin_nonconst_adjust = 0;
+      bool nonsimple_loop = false;
       rtx_insn *head, *tail;
-      rtx count_reg;
-      rtx_insn *count_init;
-      int mii, rec_mii, stage_count, min_cycle;
-      int64_t loop_count = 0;
+      int min_cycle;
       bool opt_sc_p;
+      rtx count_reg, count_fin_reg, new_comp_reg = NULL_RTX;
+      rtx_insn *count_init_insn, *count_fin_init_insn;
+      rtx_insn *add, *cmp;
+      int mii, rec_mii, cmp_side = -1, cmp_stage = -1;
+      int stage_count = 0;
+      int64_t count_init_val = 0, count_fin_val = 0;
+      int64_t count_step = 0, loop_count = -1;
+      int64_t count_fin_newval = 0;
+      struct niter_desc *desc = NULL;
 
       if (! (g = g_arr[loop->num]))
         continue;
@@ -1618,32 +1813,157 @@ sms_schedule (void)
 	               (int64_t) profile_info->sum_max);
 	      fprintf (dump_file, "\n");
 	    }
-	  fprintf (dump_file, "SMS doloop\n");
 	  fprintf (dump_file, "SMS built-ddg %d\n", g->num_nodes);
           fprintf (dump_file, "SMS num-loads %d\n", g->num_loads);
           fprintf (dump_file, "SMS num-stores %d\n", g->num_stores);
 	}
 
 
-      /* In case of th loop have doloop register it gets special
-	 handling.  */
-      count_init = NULL;
-      if ((count_reg = doloop_register_get (head, tail)))
-	{
-	  basic_block pre_header;
-
-	  pre_header = loop_preheader_edge (loop)->src;
-	  count_init = const_iteration_count (count_reg, pre_header,
-					      &loop_count);
-	}
-      gcc_assert (count_reg);
-
-      if (dump_file && count_init)
+      /* Extract count register and determine loop type.  */
+      add = NULL;
+      cmp = NULL;
+      if ((count_reg = doloop_register_get (head, tail))
+         || (count_reg = nondoloop_register_get (head, tail, 0, &add, &cmp))
+         || (count_reg = nondoloop_register_get (head, tail, 1, &add, &cmp)))
         {
-          fprintf (dump_file, "SMS const-doloop ");
-          fprintf (dump_file, "%"PRId64,
-		     loop_count);
-          fprintf (dump_file, "\n");
+          basic_block pre_header = loop_preheader_edge (loop)->src;
+
+          doloop_p = (cmp == NULL_RTX);
+          if (doloop_p)
+            {
+              /* Doloop finish parameters are always the same.  */
+              count_step = -1;
+              count_fin_isconst = true;
+              count_fin_val = 0;
+              count_fin_reg = NULL_RTX;
+              count_fin_init_insn = NULL;
+            }
+          else
+            {
+              /* In other loop we need to determine counter step
+                 and finish parameters.  */
+              rtx step, end;
+
+              gcc_assert (single_set (add) && single_set (cmp));
+
+              /* Extract the step.  */
+              step = XEXP (SET_SRC (single_set (add)), 1);
+              gcc_assert (CONST_INT_P (step));
+
+              if (GET_CODE (SET_SRC (single_set (add))) == MINUS)
+                count_step = - INTVAL (step);
+              else if (GET_CODE (SET_SRC (single_set (add))) == PLUS)
+                count_step = INTVAL (step);
+              else
+                gcc_unreachable ();
+
+              gcc_assert(count_step != 0);
+
+              /* Check what operand of compare insn is a counter register.  */
+              if (count_reg == XEXP (SET_SRC (single_set (cmp)), 0))
+                cmp_side = 0;
+              else if (count_reg == XEXP (SET_SRC (single_set (cmp)), 1))
+                cmp_side = 1;
+              else
+                gcc_unreachable ();
+
+              /* Extract finish border for counter reg.  */
+              end = XEXP (SET_SRC (single_set (cmp)), 1 - cmp_side);
+
+              if (CONST_INT_P (end))
+                {
+                  /* Constant finish border.  loop until (reg != const).  */
+                  count_fin_isconst = true;
+                  count_fin_val = INTVAL (end);
+                  count_fin_reg = NULL_RTX;
+                  count_fin_init_insn = NULL;
+                }
+              else if (REG_P (end))
+                {
+                  /* Register is a border.  Loop until (reg != fin_reg).  */
+                  count_fin_reg = end;
+                  count_fin_isconst = false;
+                  /* Try to find constant initinalization of fin_reg
+                   * in preheader.  */
+                  count_fin_init_insn = search_const_init (pre_header,
+                                                           count_fin_reg,
+                                                           &count_fin_isconst,
+                                                           &count_fin_val);
+                }
+              else
+                gcc_unreachable ();
+            }
+          /* Try to find a constant initalization of count_reg in preheader.  */
+          count_init_insn = search_const_init (pre_header,
+                                               count_reg,
+                                               &count_init_isconst,
+                                               &count_init_val);
+        }
+      else /* Loop is incompatible now, but it was OK on while analyzing!  */
+        gcc_assert (count_reg);
+
+
+      desc = get_simple_loop_desc (loop);
+      gcc_assert (desc);
+      /* nonsimple_loop means it's impossible to analyze the loop
+         or there are some assumptions to make the analyzis results right
+         or there is a condition of non-infinite number of iterations.
+         We want doloops to be scheduled even if analyzis shows they are
+         nonsimple (backward compatibility).  */
+         nonsimple_loop = !desc->simple_p;
+      /* We allow scheduling loop with some assumptions or infinite condition
+        only when unsafe_loop_optimizations flag is enabled.  */
+      if (/*flag_unsafe_loop_optimizations*/1)
+        {
+          desc->infinite = NULL_RTX;
+          desc->assumptions = NULL_RTX;
+          desc->noloop_assumptions = NULL_RTX;
+        }
+      nonsimple_loop = nonsimple_loop || (desc->assumptions != NULL_RTX)
+                       || (desc->noloop_assumptions != NULL_RTX)
+                       || (desc->infinite != NULL_RTX);
+      /* Only doloops can be nonsimple_loops for SMS.  */
+      if (nonsimple_loop && !doloop_p)
+        {
+          free_ddg (g);
+          continue;
+        }
+      /* Manually set some description fields in non-simple doloop.  */
+      if (nonsimple_loop)
+        {
+          gcc_assert(doloop_p);
+          desc->const_iter = false;
+          desc->infinite = NULL_RTX;
+        }
+
+      if (desc->const_iter)
+        {
+          gcc_assert (!desc->infinite);
+          loop_count = desc->niter;
+          if (dump_file)
+            fprintf (dump_file, "SMS const loop iterations = "
+                     "%" PRId64 "\n", loop_count);
+        }
+      if (count_init_isconst && count_fin_isconst)
+        {
+          gcc_assert (doloop_p || desc->const_iter);
+          if (doloop_p)
+            {
+              if (nonsimple_loop)
+                {
+                  loop_count = count_init_val;
+                  desc->const_iter = true;
+                }
+              gcc_assert (desc->const_iter && loop_count == count_init_val);
+            }
+          if (dump_file)
+            {
+              fprintf (dump_file, "SMS const-%s ",
+                       doloop_p ? "doloop" : "loop");
+              fprintf (dump_file, "%" PRId64 " to %" PRId64 " step %" PRId64,
+                       count_init_val, count_fin_val, count_step);
+              fprintf (dump_file, "\n");
+            }
         }
 
       node_order = XNEWVEC (int, g->num_nodes);
@@ -1694,7 +2014,7 @@ sms_schedule (void)
 	     1 means that there is no interleaving between iterations thus
 	     we let the scheduling passes do the job in this case.  */
 	  if (stage_count < PARAM_VALUE (PARAM_SMS_MIN_SC)
-	      || (count_init && (loop_count <= stage_count))
+	      || (desc->const_iter && (loop_count <= stage_count))
 	      || (flag_branch_probabilities && (trip_count <= stage_count)))
 	    {
 	      if (dump_file)
@@ -1754,24 +2074,25 @@ sms_schedule (void)
 	      print_partial_schedule (ps, dump_file);
 	    }
  
-          /* case the BCT count is not known , Do loop-versioning */
-	  if (count_reg && ! count_init)
+          if (!desc->const_iter)
             {
-	      rtx comp_rtx = gen_rtx_GT (VOIDmode, count_reg,
-					 gen_int_mode (stage_count,
-						       GET_MODE (count_reg)));
-	      unsigned prob = (PROB_SMS_ENOUGH_ITERATIONS
-			       * REG_BR_PROB_BASE) / 100;
+              /* Loop versioning if the number of iterations is unknown.  */
+              unsigned prob;
+              rtx vers_cond;
+              vers_cond = gen_rtx_fmt_ee (GT, VOIDmode, nonsimple_loop ?
+                                          count_reg : desc->niter_expr,
+                                          GEN_INT (stage_count));
+              if (dump_file)
+                {
+                  fprintf (dump_file, "\nLoop versioning condition:\n");
+                  print_rtl_single (dump_file, vers_cond);
+                }
 
-	      loop_version (loop, comp_rtx, &condition_bb,
-	  		    prob, prob, REG_BR_PROB_BASE - prob,
-			    true);
-	     }
+              prob = (PROB_SMS_ENOUGH_ITERATIONS * REG_BR_PROB_BASE) / 100;
+              loop_version (loop, vers_cond, &condition_bb, prob,
+                            prob, REG_BR_PROB_BASE - prob, true);
+            }
 
-	  /* Set new iteration count of loop kernel.  */
-          if (count_reg && count_init)
-	    SET_SRC (single_set (count_init)) = GEN_INT (loop_count
-						     - stage_count + 1);
 
 	  /* Now apply the scheduled kernel to the RTL of the loop.  */
 	  permute_partial_schedule (ps, g->closing_branch->first_note);
@@ -1787,8 +2108,140 @@ sms_schedule (void)
 	  apply_reg_moves (ps);
 	  if (dump_file)
 	    print_node_sched_params (dump_file, g->num_nodes, ps);
-	  /* Generate prolog and epilog.  */
-          generate_prolog_epilog (ps, loop, count_reg, count_init);
+
+	  if (doloop_p && count_init_isconst)
+	    {
+	      /* Change counter reg initialization constant. In more complex
+	         cases this adjustment is done with adding some insns
+		 to loop prologue in generate_prolog_epilog function.  */
+	      gcc_assert (single_set (count_init_insn) != NULL_RTX);
+	      /* FIXME: use validate_change.  */
+	      SET_SRC (single_set (count_init_insn))
+		    = GEN_INT (count_init_val - stage_count + 1);
+	    }
+
+	  if (!doloop_p)
+	    {
+	      /* Calculation of the compare insn stage in schedule.  */
+	      ps_insn_ptr crr_insn;
+	      int row, stage;
+	      cmp_stage = -1;
+	      for (row = 0; row < ps->ii; row++)
+		for (crr_insn = ps->rows[row];
+		     crr_insn;
+		     crr_insn = crr_insn->next_in_row)
+		  {
+		    stage = SCHED_STAGE (crr_insn->id);
+		    gcc_assert (0 <= stage && stage < stage_count);
+		    if (rtx_equal_p (ps_rtl_insn (ps, crr_insn->id), cmp))
+		      {
+			gcc_assert (cmp_stage == -1);
+		        cmp_stage = stage;
+		      }
+		  }
+              if (dump_file)
+		fprintf (dump_file, "cmp_stage=%d\n", cmp_stage);
+	      gcc_assert (cmp_stage >= 0);
+	    }
+
+	  /* When compare insn stage is non-zero we are to shift the final
+	     counter reg value (which counter is compared to exit loop).
+	     Final value can be an immediate or can be a register, which
+	     constant initialization we find in preheader.  */
+	  was_immediate = false;
+	  if (!doloop_p && count_fin_isconst && cmp_stage > 0)
+	    {
+              gcc_assert (0 <= cmp_side && cmp_side <= 1);
+	      /* New finish value.  */
+	      count_fin_newval = count_fin_val - count_step * cmp_stage;
+	      was_immediate = CONST_INT_P (XEXP (SET_SRC (single_set (cmp)),
+							  1 - cmp_side));
+	      if (was_immediate)
+		{
+		  /* Check whether new value also can be an immediate.
+		     For exapmle, on ARM not all values can be encoded as
+		     an immediate, so we have to load it to a register once
+		     before the loop starts.  */
+		  validate_unshare_change (cmp,
+			&XEXP (SET_SRC (single_set (cmp)), 1 - cmp_side),
+			GEN_INT (count_fin_newval), 1);
+		  prolog_create_reg = !verify_changes (0);
+		  cancel_changes (0);
+	        }
+	      else
+		{
+		  /* A value is already in a register and we easily change
+		     initialization instruction in preheader.  */
+		  /* FIXME: not valid?  */
+		  bool valid = false;
+		  gcc_assert (count_fin_init_insn);
+		  valid = validate_unshare_change (count_fin_init_insn,
+				&SET_SRC (single_set (count_fin_init_insn)),
+				GEN_INT (count_fin_newval), 0);
+		  gcc_checking_assert (valid);
+		}
+
+              if (dump_file)
+		fprintf (dump_file, "count_fin_val=%" PRId64 "\n"
+			 "count_fin_newval=%" PRId64 "\nwas_immediate=%d\n"
+			 "prolog_create_reg=%d\n",
+			 count_fin_val, count_fin_newval, was_immediate,
+			 prolog_create_reg);
+	    }
+
+	  /* The adjustment of finish register value.
+	     Zero means no adjustment needed or adjusment is done
+	     without additional insn in prologue.  */
+	  if (!doloop_p && !count_fin_isconst)
+	    prolog_fin_nonconst_adjust = count_step * cmp_stage;
+
+	  /* Ready to generate prolog and epilog.  */
+	  generate_prolog_epilog (ps, loop, count_reg, doloop_p,
+			          count_init_isconst, count_fin_reg,
+				  prolog_fin_nonconst_adjust,
+				  prolog_create_reg, count_fin_newval,
+				  &new_comp_reg);
+
+	  /* And only after generating prolog and epilog it is possible
+	     to modify the compare instruction (to prevent copying wrong insn
+	     form to first and last stages).  */
+	  if (!doloop_p && cmp_stage > 0)
+	    {
+              gcc_assert (0 <= cmp_side && cmp_side <= 1);
+	      if (was_immediate && !prolog_create_reg)
+		{
+		  bool valid = false;
+		  /* Modify a constant, must be possible.  */
+		  gcc_assert (new_comp_reg == NULL_RTX);
+		  valid = validate_unshare_change (cmp,
+			    &XEXP (SET_SRC (single_set (cmp)), 1 - cmp_side),
+			    GEN_INT (count_fin_newval), 0);
+		  gcc_checking_assert (valid);
+		}
+	      else
+		{
+		  if (count_fin_isconst && !was_immediate)
+		    /* Value is in a register and we already changed
+		       initialization instruction in preheader.  */
+		    gcc_assert (new_comp_reg == NULL_RTX);
+		  else
+		    {
+		      /* Another case - use created by generate_prolog_epilog
+		         register, which value is initialized in prologue.  */
+		      bool valid = false;
+		      gcc_assert (new_comp_reg != NULL_RTX);
+		      /* FIXME: not valid?  */
+		      valid = validate_unshare_change (cmp,
+				&XEXP (SET_SRC (single_set (cmp)),
+						1 - cmp_side),
+				new_comp_reg, 0);
+		      gcc_checking_assert (valid);
+		    }
+		}
+	    }
+	  else
+	    gcc_assert (new_comp_reg == NULL_RTX);
+
 	  break;
 	}
 
@@ -1798,7 +2251,9 @@ sms_schedule (void)
       free_ddg (g);
     }
 
+  df_set_flags (DF_LR_RUN_DCE);
   free (g_arr);
+  iv_analysis_done ();
 
   /* Release scheduler data, needed until now because of DFA.  */
   haifa_sched_finish ();
