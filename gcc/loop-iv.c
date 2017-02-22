@@ -2843,14 +2843,6 @@ iv_number_of_iterations (struct loop *loop, rtx insn, rtx condition,
 	  && !desc->assumptions)
 	record_niter_bound (loop, double_int::from_uhwi (max),
 			    false, true);
-
-      /* simplify_using_initial_values does a copy propagation on the registers
-	 in the expression for the number of iterations.  This prolongs life
-	 ranges of registers and increases register pressure, and usually
-	 brings no gain (and if it happens to do, the cse pass will take care
-	 of it anyway).  So prevent this behavior, unless it enabled us to
-	 derive that the number of iterations is a constant.  */
-      desc->niter_expr = old_niter;
     }
 
   return;
