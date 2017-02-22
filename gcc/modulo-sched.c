@@ -740,6 +740,7 @@ schedule_reg_moves (partial_schedule_ptr ps)
 	continue;
 
       /* Create NREG_MOVES register moves.  */
+      gcc_assert (flag_modulo_sched_allow_regmoves);
       first_move = ps->reg_moves.length ();
       ps->reg_moves.safe_grow_cleared (first_move + nreg_moves);
       extend_node_sched_params (ps);

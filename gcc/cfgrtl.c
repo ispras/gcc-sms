@@ -4937,6 +4937,7 @@ rtl_lv_add_condition_to_bb (basic_block first_head ,
   start_sequence ();
   op0 = force_operand (op0, NULL_RTX);
   op1 = force_operand (op1, NULL_RTX);
+  gcc_assert (op0 && op1);
   do_compare_rtx_and_jump (op0, op1, comp, 0,
 			   mode, NULL_RTX, NULL_RTX, label, -1);
   jump = get_last_insn ();
