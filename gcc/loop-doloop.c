@@ -113,7 +113,6 @@ doloop_condition_get (rtx doloop_pat)
 
   if (GET_CODE (pattern) != PARALLEL)
     {
-      rtx cond;
       rtx_insn *prev_insn = prev_nondebug_insn (doloop_pat);
       rtx cmp_arg1, cmp_arg2;
       rtx cmp_orig;
@@ -152,10 +151,6 @@ doloop_condition_get (rtx doloop_pat)
 	}
       else
         inc = PATTERN (prev_insn);
-      /* We expect the condition to be of the form (reg != 0)  */
-      cond = XEXP (SET_SRC (cmp), 0);
-      if (GET_CODE (cond) != NE || XEXP (cond, 1) != const0_rtx)
-        return 0;
     }
   else
     {
@@ -193,12 +188,23 @@ doloop_condition_get (rtx doloop_pat)
   /* Extract loop termination condition.  */
   condition = XEXP (SET_SRC (cmp), 0);
 
-  /* We expect a GE or NE comparison with 0 or 1.  */
-  if ((GET_CODE (condition) != GE
-       && GET_CODE (condition) != NE)
-      || (XEXP (condition, 1) != const0_rtx
-          && XEXP (condition, 1) != const1_rtx))
-    return 0;
+  if (GET_CODE (pattern) == PARALLEL)
+    {
+      /* We expect a GE or NE comparison with 0 or 1.  */
+      if ((GET_CODE (condition) != GE
+	   && GET_CODE (condition) != NE)
+	   || (XEXP (condition, 1) != const0_rtx
+	   && XEXP (condition, 1) != const1_rtx))
+        return 0;
+    }
+  else
+    {
+      /* In the second and third cases, we expect the condition
+         to be of the form (reg != 0)  */
+      if (GET_CODE (condition) != NE
+	  || XEXP (condition, 1) != const0_rtx)
+        return 0;
+    }
 
   if ((XEXP (condition, 0) == reg)
       /* For the third case:  */  
