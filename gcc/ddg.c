@@ -221,23 +221,35 @@ create_ddg_dep_from_intra_loop_link (ddg_ptr g, ddg_node_ptr src_node,
       && !def_has_ccmode_p (dest_node->insn)
       && !autoinc_var_is_used_p (dest_node->insn, src_node->insn))
     {
-      rtx set;
+      df_ref *def_rec;
+      bool can_delete_dep = true;
 
-      set = single_set (dest_node->insn);
-      /* TODO: Handle registers that REG_P is not true for them, i.e.
+      /* TODO: Handle !REG_P register correctly, i.e.
          subregs and special registers.  */
-      if (set && REG_P (SET_DEST (set)))
-        {
-          int regno = REGNO (SET_DEST (set));
-          df_ref first_def;
-          struct df_rd_bb_info *bb_info = DF_RD_BB_INFO (g->bb);
+      for (def_rec = DF_INSN_DEFS (dest_node->insn); *def_rec; def_rec++)
+	{
+	  df_ref first_def, *use_rec;
+          df_ref def = *def_rec;
+	  unsigned regno = DF_REF_REGNO (def);
+	  struct df_rd_bb_info *bb_info = DF_RD_BB_INFO (g->bb);
+	  bool src_uses = false;
 
-          first_def = df_bb_regno_first_def_find (g->bb, regno);
-          gcc_assert (first_def);
+	  for (use_rec = DF_INSN_USES (src_node->insn); *use_rec; use_rec++)
+	    if (regno == DF_REF_REGNO (*use_rec))
+	      src_uses = true;
 
-          if (bitmap_bit_p (&bb_info->gen, DF_REF_ID (first_def)))
-            return;
-        }
+	  if (!src_uses)
+	    continue;
+
+	  first_def = df_bb_regno_first_def_find (g->bb, regno);
+	  gcc_assert (first_def);
+
+	  if (HARD_REGISTER_NUM_P (regno)
+	      || !bitmap_bit_p (&bb_info->gen, DF_REF_ID (first_def)))
+	    can_delete_dep = false;
+	}
+      if (can_delete_dep)
+	return;
     }
 
    latency = dep_cost (link);
