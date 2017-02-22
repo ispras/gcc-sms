@@ -1353,9 +1353,15 @@ simple_rhs_p (rtx rhs)
     case AND:
       op0 = XEXP (rhs, 0);
       op1 = XEXP (rhs, 1);
-      /* Allow reg OP const and reg OP reg.  */
+      /* Allow op0 to be reg or expression like "reg mult const".
+       * Allow op1 to be reg or const.  */
       if (!(REG_P (op0) && !HARD_REGISTER_P (op0))
-	  && !function_invariant_p (op0))
+	  && !function_invariant_p (op0)
+	  && !(((GET_CODE (op0) == ASHIFT)
+		|| (GET_CODE (op0) == ASHIFTRT)
+		|| (GET_CODE (op0) == LSHIFTRT)
+		|| (GET_CODE (op0) == MULT)
+	       ) && simple_rhs_p (op0)))
 	return false;
       if (!(REG_P (op1) && !HARD_REGISTER_P (op1))
 	  && !function_invariant_p (op1))
