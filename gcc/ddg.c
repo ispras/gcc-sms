@@ -432,7 +432,7 @@ add_intra_loop_mem_dep (ddg_ptr g, ddg_node_ptr from, ddg_node_ptr to)
 /* Given two nodes, analyze their RTL insns and add inter-loop mem deps
    to ddg G.  */
 static void
-add_inter_loop_mem_dep (ddg_ptr g, ddg_node_ptr from, ddg_node_ptr to)
+add_inter_loop_mem_dep (ddg_ptr g, ddg_node_ptr from, ddg_node_ptr to, int from_index)
 {
   if (!insns_may_alias_p (from->insn, to->insn))
     /* Do not create edge if memory references have disjoint alias sets.  */
@@ -456,10 +456,13 @@ add_inter_loop_mem_dep (ddg_ptr g, ddg_node_ptr from, ddg_node_ptr to)
       else if (from->cuid != to->cuid)
 	{
 	  create_ddg_dep_no_link (g, from, to, ANTI_DEP, MEM_DEP, 1);
-	  if (DEBUG_INSN_P (from->insn) || DEBUG_INSN_P (to->insn))
-	    create_ddg_dep_no_link (g, to, from, ANTI_DEP, MEM_DEP, 1);
-	  else
-	    create_ddg_dep_no_link (g, to, from, TRUE_DEP, MEM_DEP, 1);
+	  if (! bitmap_bit_p (to->successors, from_index))
+	    {
+	      if (DEBUG_INSN_P (from->insn) || DEBUG_INSN_P (to->insn))
+		create_ddg_dep_no_link (g, to, from, ANTI_DEP, MEM_DEP, 1);
+	      else
+		create_ddg_dep_no_link (g, to, from, TRUE_DEP, MEM_DEP, 1);
+	    }
 	}
     }
 
@@ -528,7 +531,7 @@ build_intra_loop_deps (ddg_ptr g)
 		  /* Don't bother calculating inter-loop dep if an intra-loop dep
 		     already exists.  */
 	      	  if (! bitmap_bit_p (dest_node->successors, j))
-		    add_inter_loop_mem_dep (g, dest_node, j_node);
+		    add_inter_loop_mem_dep (g, dest_node, j_node, i);
 		  /* If -fmodulo-sched-allow-regmoves
 		     is set certain anti-dep edges are not created.
 		     It might be that these anti-dep edges are on the
